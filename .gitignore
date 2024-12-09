@@ -1,0 +1,7 @@
+/wandb
+/data/images
+**/__pycache__
+/datasets
+/pre_model
+/runs
+/.idea
