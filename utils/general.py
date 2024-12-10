@@ -32,6 +32,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pkg_resources as pkg
+import matplotlib.pyplot as plt
 import torch
 import torchvision
 import yaml
@@ -121,6 +122,40 @@ def is_writeable(dir, test=False):
 
 
 LOGGING_NAME = 'yolov5'
+
+
+def plot_results(start=0, stop=0, bucket='', id=(), labels=(),
+                 save_dir=''):  # from utils.general import *; plot_results()
+    # Plot training 'results*.txt' as seen in https://github.com/ultralytics/yolov5#reproduce-our-training
+    fig, ax = plt.subplots(1, 4, figsize=(10, 6))
+    ax = ax.ravel()
+    s = ['Segloss', 'PA', 'IoU', 'mIoU']
+    if bucket:
+        os.system('rm -rf storage.googleapis.com')
+        files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
+    else:
+        files = glob.glob(str(Path(save_dir) / 'results*.txt')) + glob.glob('../../Downloads/results*.txt')
+    for fi, f in enumerate(files):
+        try:
+            results = np.loadtxt(f, usecols=[2, 6, 7, 8], ndmin=2).T
+            n = results.shape[1]  # number of rows
+            x = range(start, min(stop, n) if stop else n)
+            for i in range(4):
+                y = results[i, x]
+                if i in [0]:
+                    y[y == 0] = np.nan  # dont show zero loss values
+                    # y /= y[0]  # normalize
+                label = labels[fi] if len(labels) else Path(f).stem
+                ax[i].plot(x, y, marker='.', label=label, linewidth=2, markersize=8)
+                ax[i].set_title(s[i])
+                # if i in [5, 6, 7]:  # share train and val loss y axes
+                #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
+        except:
+            print('Warning: Plotting error for %s, skipping file' % f)
+
+    fig.tight_layout()
+    ax[1].legend()
+    fig.savefig(Path(save_dir) / 'results.png', dpi=200)
 
 
 def set_logging(name=LOGGING_NAME, verbose=True):
@@ -243,6 +278,11 @@ def print_args(args: Optional[dict] = None, show_file=True, show_func=False):
         file = Path(file).stem
     s = (f'{file}: ' if show_file else '') + (f'{func}: ' if show_func else '')
     LOGGER.info(colorstr(s) + ', '.join(f'{k}={v}' for k, v in args.items()))
+
+
+def print_seg_args(name, opt):
+    # Print argparser arguments
+    LOGGER.info(colorstr(f'{name}: ') + ', '.join(f'{k}={v}' for k, v in vars(opt).items()))
 
 
 def init_seeds(seed=0, deterministic=False):
@@ -518,14 +558,14 @@ def check_dataset(data, autodownload=True):
     # Read yaml
     if isinstance(data, (str, Path)):
         data = yaml_load(data)  # dictionary
-
-    # 检查有没有 train val names(种类标签)这三个文件
-    for k in 'train', 'val', 'names':
-        assert k in data, emojis(f"data.yaml '{k}:' field missing ❌")
-    if isinstance(data['names'], (list, tuple)):  # old array format
-        data['names'] = dict(enumerate(data['names']))  # convert to dict
-    assert all(isinstance(k, int) for k in data['names'].keys()), 'data.yaml names keys must be integers, i.e. 2: car'
-    data['nc'] = len(data['names'])
+    #
+    # # 检查有没有 train val names(种类标签)这三个文件
+    # for k in 'train', 'val', 'names':
+    #     assert k in data, emojis(f"data.yaml '{k}:' field missing ❌")
+    # if isinstance(data['names'], (list, tuple)):  # old array format
+    #     data['names'] = dict(enumerate(data['names']))  # convert to dict
+    # assert all(isinstance(k, int) for k in data['names'].keys()), 'data.yaml names keys must be integers, i.e. 2: car'
+    # data['nc'] = len(data['names'])
 
     # Resolve paths，都变成绝对路径
     path = Path(extract_dir or data.get('path') or '')  # optional 'path' default to '.'
@@ -567,7 +607,7 @@ def check_dataset(data, autodownload=True):
             dt = f'({round(time.time() - t, 1)}s)'
             s = f"success ✅ {dt}, saved to {colorstr('bold', DATASETS_DIR)}" if r in (0, None) else f'failure {dt} ❌'
             LOGGER.info(f'Dataset download {s}')
-    check_font('Arial.ttf' if is_ascii(data['names']) else 'Arial.Unicode.ttf', progress=True)  # download fonts
+    # check_font('Arial.ttf' if is_ascii(data['names']) else 'Arial.Unicode.ttf', progress=True)  # download fonts
     return data  # dictionary
 
 

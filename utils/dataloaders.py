@@ -17,7 +17,7 @@ from multiprocessing.pool import Pool, ThreadPool
 from pathlib import Path
 from threading import Thread
 from urllib.parse import urlparse
-
+from collections import Counter
 import numpy as np
 import psutil
 import torch
@@ -28,11 +28,12 @@ from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
-from utils.augmentations import (Albumentations, augment_hsv, classify_albumentations, classify_transforms, copy_paste,
-                                 letterbox, mixup, random_perspective)
+from utils.augmentations import (Albumentations, SegAlbumentations, augment_hsv, classify_albumentations,
+                                 classify_transforms, copy_paste, segletterbox,
+                                 letterbox, mixup, random_perspective, random_segmentation_perspective)
 from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, check_dataset, check_requirements,
                            check_yaml, clean_str, cv2, is_colab, is_kaggle, segments2boxes, unzip_file, xyn2xy,
-                           xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
+                           xywh2xyxy, xywhn2xyxy, xyxy2xywhn, colorstr)
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -42,7 +43,7 @@ VID_FORMATS = 'asf', 'avi', 'gif', 'm4v', 'mkv', 'mov', 'mp4', 'mpeg', 'mpg', 't
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 PIN_MEMORY = str(os.getenv('PIN_MEMORY', True)).lower() == 'true'  # global pin_memory for dataloaders
-
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 # Get orientation exif tag
 for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == 'Orientation':
@@ -100,6 +101,40 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 
+def create_seg_dataloader(path, clsnum, imgsz, batch_size, stride, single_cls=False, hyp=None, augment=False,
+                          cache=False,
+                          pad=0.0,
+                          rect=False, rank=-1, workers=8, image_weights=False, quad=False, prefix='',
+                          shuffle=False):
+    if rect and shuffle:
+        LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
+        shuffle = False
+    with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
+        dataset = LoadSegImagesAndLabels(path, clsnum, imgsz, batch_size,
+                                         augment=augment,  # augmentation
+                                         hyp=hyp,  # hyperparameters
+                                         rect=rect,  # rectangular batches
+                                         cache_images=cache,
+                                         single_cls=single_cls,
+                                         stride=int(stride),
+                                         pad=pad,
+                                         image_weights=image_weights,
+                                         prefix=prefix)
+
+    batch_size = min(batch_size, len(dataset))
+    nw = min([os.cpu_count() // WORLD_SIZE, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    sampler = None if rank == -1 else distributed.DistributedSampler(dataset, shuffle=shuffle)
+    loader = InfiniteSegDataLoader if prefix == colorstr(
+        'train: ') else DataLoader  # only DataLoader allows for attribute updates
+    return loader(dataset,
+                  batch_size=batch_size,
+                  shuffle=shuffle and sampler is None,
+                  num_workers=nw,
+                  sampler=sampler,
+                  pin_memory=True,
+                  ), dataset
+
+
 def create_dataloader(path,
                       imgsz,
                       batch_size,
@@ -151,6 +186,25 @@ def create_dataloader(path,
                   collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
                   worker_init_fn=seed_worker,
                   generator=generator), dataset
+
+
+class InfiniteSegDataLoader(dataloader.DataLoader):
+    """ Dataloader that reuses workers
+
+    Uses same syntax as vanilla DataLoader
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        object.__setattr__(self, 'batch_sampler', _RepeatSampler(self.batch_sampler))
+        self.iterator = super().__iter__()
+
+    def __len__(self):
+        return len(self.batch_sampler.sampler)
+
+    def __iter__(self):
+        while True:
+            yield next(self.iterator)
 
 
 class InfiniteDataLoader(dataloader.DataLoader):
@@ -439,15 +493,249 @@ class LoadStreams:
         # return self.sources, im, im0, None, ''
         return self.sources, im, im0, self.cap, " "
 
-
     def __len__(self):
         return len(self.sources)  # 1E12 frames = 32 streams at 30 FPS for 30 years
+
+
+def segimg2label_paths(img_paths):
+    # Define label paths as a function of image paths
+    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.png' for x in img_paths]
 
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
     sa, sb = f'{os.sep}images{os.sep}', f'{os.sep}labels{os.sep}'  # /images/, /labels/ substrings
     return [sb.join(x.rsplit(sa, 1)).rsplit('.', 1)[0] + '.txt' for x in img_paths]
+
+
+class LoadSegImagesAndLabels(Dataset):
+    # YOLOv5 train_loader/val_loader, loads segmentation images and labels for training and validation
+    cache_version = 0.6  # dataset labels *.cache version
+
+    def __init__(self, path, cls_num=20, img_size=640, batch_size=16, augment=False, hyp=None, rect=False,
+                 image_weights=False,
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+        self.img_size = img_size
+        self.label_mapping = {k: 0 for k in range(0, 256)}
+        self.val = False if prefix == colorstr('train: ') else True
+
+        self.augment = augment
+        self.hyp = hyp
+        self.image_weights = image_weights
+        self.rect = False if image_weights else rect
+        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.stride = stride
+        self.path = path
+        self.albumentations = SegAlbumentations() if augment else None
+
+        try:
+            f = []  # image files
+            for p in path if isinstance(path, list) else [path]:
+                p = Path(p)  # os-agnostic
+                if p.is_dir():  # dir
+                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
+                    # f = list(p.rglob('*.*'))  # pathlib
+                elif p.is_file():  # file
+                    with open(p) as t:
+                        t = t.read().strip().splitlines()
+                        parent = str(p.parent) + os.sep
+                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
+                else:
+                    raise Exception(f'{prefix}{p} does not exist')
+            self.img_files = sorted(x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in IMG_FORMATS)
+
+            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
+            assert self.img_files, f'{prefix}No images found'
+        except Exception as e:
+            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {HELP_URL}')
+
+        # Check cache
+        self.label_files = segimg2label_paths(self.img_files)  # labels
+        # if prefix == colorstr('train: '):
+        labelcounter = []
+        for img in self.label_files:
+            image = cv2.imread(img, cv2.IMREAD_GRAYSCALE)
+            im1 = np.array(image)  # 由于可能对im1直接进行运算，对整型的像
+
+            # arr = im1.flatten()  # 将2D 数组变成一个一维数组
+            num = im1.flatten().tolist()
+            if None in num:
+                print(img)
+            labelcounter.extend(num)
+
+        labelcounter = Counter(labelcounter)
+        labelcounter = dict(labelcounter)
+        segcls = sorted(list(labelcounter.keys()))
+        seg_weights = [labelcounter[i] for i in segcls]
+        seg_weights_balance = [math.pow(i, 1 / 5) for i in seg_weights]
+        self.seg_weights = [max(seg_weights_balance) / i for i in seg_weights_balance]
+        # update label map
+        for i, cls in enumerate(segcls):
+            self.label_mapping[cls] = i
+
+        self.indices = range(len(self.img_files))
+
+    def __len__(self):
+        return len(self.img_files)
+
+    def convert_label(self, label, inverse=False):
+        temp = label.copy()
+        if inverse:
+            for v, k in self.label_mapping.items():
+                label[temp == k] = v
+        else:
+            for k, v in self.label_mapping.items():
+                label[temp == k] = v
+        return label
+
+    def __getitem__(self, index):
+        index = self.indices[index]  # linear, shuffled, or image_weights
+        hyp = self.hyp
+        # mosaic = self.mosaic and random.random() < hyp['mosaic']
+        mosaic = 0.5  ### masic ratio
+        if random.random() < mosaic and not self.val:
+            # print("using segmentation masic ...")
+            # Load mosaic
+            img, labels = self.load_seg_mosaic(index)
+            shapes = ((1080, 1920), ((0.3333333333333333, 0.3333333333333333), (0.0, 140.0)))
+
+        else:
+            # Load image
+            img, labels, (h0, w0), (h, w) = self.load_segimagelabel(index)
+
+            # Letterbox
+            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
+            img, labels, ratio, pad = segletterbox(img, labels, shape, auto=False, scaleup=self.augment)
+            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+            if self.augment:
+                img, labels = random_segmentation_perspective(img, labels,
+                                                              degrees=hyp['degrees'],
+                                                              translate=hyp['translate'],
+                                                              scale=hyp['scale'],
+                                                              shear=hyp['shear'],
+                                                              perspective=hyp['perspective'])
+
+        # print(shapes)
+
+        if self.augment:
+            # Albumentations
+            img = self.albumentations(img)
+            nl = len(labels)  # update after albumentations
+
+            # HSV color-space
+            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+
+            # Flip left-right
+            if random.random() < hyp['fliplr']:
+                img = np.fliplr(img)
+                labels = np.fliplr(labels)
+
+        # Convert
+        labels = self.convert_label(labels)
+        # cv2.imwrite("image.jpg",img)
+        # cv2.imwrite("labels.jpg",labels)
+        img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        labels = np.ascontiguousarray(labels)
+        img = np.ascontiguousarray(img)
+
+        return torch.from_numpy(img), torch.from_numpy(labels), self.img_files[index], shapes
+
+    def load_seg_mosaic(self, index):
+        # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
+        labels4, segments4 = [], []
+        s = self.img_size
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
+        indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
+        random.shuffle(indices)
+        for i, index in enumerate(indices):
+            # Load image
+            img, label, _, (h, w) = self.load_segimagelabel(index)
+
+            # place img in img4
+            if i == 0:  # top left
+                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                label4 = np.full((s * 2, s * 2), 0, dtype=np.uint8)  # base image with 4 tiles
+                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
+            elif i == 1:  # top right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+            elif i == 2:  # bottom left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
+            elif i == 3:  # bottom right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+
+            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+            label4[y1a:y2a, x1a:x2a] = label[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
+
+            # sx1 = self.img_size
+            # img4n = img4[sx1//2:(sx1+sx1//2), sx1//2:(sx1+sx1//2),:]
+            # label4n = label4[sx1//2:(sx1+sx1//2), sx1//2:(sx1+sx1//2)]
+            # print(img4n.shape, label4n.shape)
+
+        img4, label4 = random_segmentation_perspective(img4, label4,
+                                                       degrees=self.hyp['degrees'],
+                                                       translate=self.hyp['translate'],
+                                                       scale=self.hyp['scale'],
+                                                       shear=self.hyp['shear'],
+                                                       perspective=self.hyp['perspective'],
+                                                       border=self.mosaic_border)  # border to remove
+
+        return img4, label4
+
+    def load_segimagelabel(self, i):
+        # loads 1 image from dataset index 'i', returns im, original hw, resized hw
+        path = self.img_files[i]
+        lpath = self.label_files[i]
+        im = cv2.imread(path)  # BGR
+        label = cv2.imread(lpath, cv2.IMREAD_GRAYSCALE)  # BGR
+        assert im is not None, f'Image Not Found {path}'
+        assert label is not None, f'Image Not Found {lpath}'
+        h0, w0 = im.shape[:2]  # orig hw
+        r = self.img_size / max(h0, w0)  # ratio
+        if r != 1:  # if sizes are not equal
+            im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
+                            interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+            label = cv2.resize(label, (int(w0 * r), int(h0 * r)),
+                               interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+        return im, label, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
+
+    @staticmethod
+    def collate_fn(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        # print(img.shape, label.shape)
+        return img, label, path, shapes
+
+    @staticmethod
+    def collate_fn4(batch):
+        img, label, path, shapes = zip(*batch)  # transposed
+        n = len(shapes) // 4
+        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+
+        ho = torch.tensor([[0.0, 0, 0, 1, 0, 0]])
+        wo = torch.tensor([[0.0, 0, 1, 0, 0, 0]])
+        s = torch.tensor([[1, 1, 0.5, 0.5, 0.5, 0.5]])  # scale
+        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
+            i *= 4
+            if random.random() < 0.5:
+                im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2.0, mode='bilinear', align_corners=False)[
+                    0].type(img[i].type())
+                l = label[i]
+            else:
+                im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
+                l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
+            img4.append(im)
+            label4.append(l)
+
+        for i, l in enumerate(label4):
+            l[:, 0] = i  # add target image index for build_targets()
+
+        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
 
 
 class LoadImagesAndLabels(Dataset):

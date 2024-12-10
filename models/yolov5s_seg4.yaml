@@ -1,0 +1,41 @@
+
+segnc: 2  # number of classes
+
+depth_multiple: 1  # model depth multiple
+width_multiple: 1  # layer channel multiple
+
+# YOLOv5 v6.0 backbone
+backbone:
+  # [from, number, module, args]
+  [[-1, 1, Conv, [32, 6, 2, 2]],  # 0-P1/2 k=6, s=2, p=2
+   [-1, 1, Conv, [64, 3, 2]],  # 1-P2/4 128个3×3的卷积核，stride为2
+   [-1, 1, C3, [64]],
+   [-1, 1, Conv, [128, 3, 2]],  # 3-P3/8
+   [-1, 2, C3, [128]],
+   [-1, 1, Conv, [256, 3, 2]],  # 5-P4/16
+   [-1, 3, C3, [256]],
+   [-1, 1, SPPF, [256, 5]],  # 7
+  ]
+
+# head
+seghead:
+   [[-1, 1, Conv, [128, 1, 1]],
+   [-1, 1, nn.Upsample, [None, 2, 'nearest']],
+   [[-1, 4], 1, Concat, [1]],  #10 cat backbone P3
+
+   [ -1, 1, Conv, [128, 3, 1 ] ],   #  11
+   [ -1, 1, nn.Upsample, [None, 2, 'nearest' ] ],  #12 /4
+   [[-1, 2], 1, Concat, [1]],  # cat backbone P2  13
+   [ -1, 1, C3, [128, False ] ],  # 14
+
+   [ -1, 1, Conv, [64, 3, 1 ] ],    #
+   [ -1, 1, nn.Upsample, [ None, 2, 'nearest' ] ],  #16 /2
+   [[-1, 0], 1, Concat, [1]],  # cat backbone P1
+
+   [ -1, 1, Conv, [32, 3, 1 ] ],    #18
+   [ -1, 1, C3, [32, False ] ],    #
+   [ -1, 1, nn.Upsample, [None, 2, 'nearest' ] ],  # /1
+
+   [ -1, 1, nn.Conv2d, [32, 2, 3, 1, 1 ] ], #21 segmentation head
+  ]
+

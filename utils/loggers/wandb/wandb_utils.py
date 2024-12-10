@@ -8,8 +8,9 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+import yaml
 
-from utils.general import LOGGER, colorstr
+from utils.general import LOGGER, colorstr, check_file
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[3]  # YOLOv5 root directory
@@ -26,6 +27,11 @@ try:
     LOGGER.warning(DEPRECATION_WARNING)
 except (ImportError, AssertionError):
     wandb = None
+WANDB_ARTIFACT_PREFIX = 'wandb-artifact://'
+
+
+def remove_prefix(from_string, prefix=WANDB_ARTIFACT_PREFIX):
+    return from_string[len(prefix):]
 
 
 class WandbLogger():
@@ -176,6 +182,53 @@ class WandbLogger():
                     wandb.log(self.log_dict)
             wandb.run.finish()
             LOGGER.warning(DEPRECATION_WARNING)
+
+
+def get_run_info(run_path):
+    run_path = Path(remove_prefix(run_path, WANDB_ARTIFACT_PREFIX))
+    run_id = run_path.stem
+    project = run_path.parent.stem
+    entity = run_path.parent.parent.stem
+    model_artifact_name = 'run_' + run_id + '_model'
+    return entity, project, run_id, model_artifact_name
+
+
+def check_wandb_resume(opt):
+    process_wandb_config_ddp_mode(opt) if RANK not in [-1, 0] else None
+    if isinstance(opt.resume, str):
+        if opt.resume.startswith(WANDB_ARTIFACT_PREFIX):
+            if RANK not in [-1, 0]:  # For resuming DDP runs
+                entity, project, run_id, model_artifact_name = get_run_info(opt.resume)
+                api = wandb.Api()
+                artifact = api.artifact(entity + '/' + project + '/' + model_artifact_name + ':latest')
+                modeldir = artifact.download()
+                opt.weights = str(Path(modeldir) / "last.pt")
+            return True
+    return None
+
+
+def process_wandb_config_ddp_mode(opt):
+    with open(check_file(opt.data), errors='ignore') as f:
+        data_dict = yaml.safe_load(f)  # data dict
+    train_dir, val_dir = None, None
+    if isinstance(data_dict['train'], str) and data_dict['train'].startswith(WANDB_ARTIFACT_PREFIX):
+        api = wandb.Api()
+        train_artifact = api.artifact(remove_prefix(data_dict['train']) + ':' + opt.artifact_alias)
+        train_dir = train_artifact.download()
+        train_path = Path(train_dir) / 'data/images/'
+        data_dict['train'] = str(train_path)
+
+    if isinstance(data_dict['val'], str) and data_dict['val'].startswith(WANDB_ARTIFACT_PREFIX):
+        api = wandb.Api()
+        val_artifact = api.artifact(remove_prefix(data_dict['val']) + ':' + opt.artifact_alias)
+        val_dir = val_artifact.download()
+        val_path = Path(val_dir) / 'data/images/'
+        data_dict['val'] = str(val_path)
+    if train_dir or val_dir:
+        ddp_data_path = str(Path(val_dir) / 'wandb_local_data.yaml')
+        with open(ddp_data_path, 'w') as f:
+            yaml.safe_dump(data_dict, f)
+        opt.data = ddp_data_path
 
 
 @contextmanager
